@@ -11,7 +11,14 @@ import (
 	"encoding/binary"
 	"fmt"
 	"io"
+
+	"github.com/pkg/errors"
 )
+
+// extendedTimestampMarker is the value of a 24bits timestamp (delta) field
+// which indicates that the actual value is stored in the 32bits extended
+// timestamp field.
+const extendedTimestampMarker = 0xffffff
 
 type chunkBasicHeader struct {
 	fmt           byte
@@ -105,12 +112,15 @@ func decodeChunkMessageHeader(r io.Reader, fmt byte, buf []byte, mh *chunkMessag
 		mh.messageTypeID = buf[6]                                  // 8bits
 		mh.messageStreamID = binary.LittleEndian.Uint32(buf[7:11]) // 32bits
 
-		if mh.timestamp == 0xffffff {
-			_, err := io.ReadAtLeast(r, cache32bits, 4)
+		if mh.timestamp == extendedTimestampMarker {
+			ts, err := decodeExtendedTimestamp(r, cache32bits)
 			if err != nil {
 				return err
 			}
-			mh.timestamp = binary.BigEndian.Uint32(cache32bits)
+			if ts < extendedTimestampMarker {
+				return errors.Errorf("Invalid extended timestamp: %d", ts)
+			}
+			mh.timestamp = ts
 		}
 
 	case 1:
@@ -124,12 +134,15 @@ func decodeChunkMessageHeader(r io.Reader, fmt byte, buf []byte, mh *chunkMessag
 		mh.messageLength = binary.BigEndian.Uint32(cache32bits)
 		mh.messageTypeID = buf[6] // 8bits
 
-		if mh.timestampDelta == 0xffffff {
-			_, err := io.ReadAtLeast(r, cache32bits, 4)
+		if mh.timestampDelta == extendedTimestampMarker {
+			td, err := decodeExtendedTimestamp(r, cache32bits)
 			if err != nil {
 				return err
 			}
-			mh.timestampDelta = binary.BigEndian.Uint32(cache32bits)
+			if td < extendedTimestampMarker {
+				return errors.Errorf("Invalid extended timestamp delta: %d", td)
+			}
+			mh.timestampDelta = td
 		}
 
 	case 2:
@@ -140,12 +153,15 @@ func decodeChunkMessageHeader(r io.Reader, fmt byte, buf []byte, mh *chunkMessag
 		copy(cache32bits[1:], buf[0:3]) // 24bits BE
 		mh.timestampDelta = binary.BigEndian.Uint32(cache32bits)
 
-		if mh.timestampDelta == 0xffffff {
-			_, err := io.ReadAtLeast(r, cache32bits, 4)
+		if mh.timestampDelta == extendedTimestampMarker {
+			td, err := decodeExtendedTimestamp(r, cache32bits)
 			if err != nil {
 				return err
 			}
-			mh.timestampDelta = binary.BigEndian.Uint32(cache32bits)
+			if td < extendedTimestampMarker {
+				return errors.Errorf("Invalid extended timestamp delta: %d", td)
+			}
+			mh.timestampDelta = td
 		}
 
 	case 3:
@@ -167,8 +183,8 @@ func encodeChunkMessageHeader(w io.Writer, fmt byte, mh *chunkMessageHeader) err
 	case 0:
 		buflen := 11
 		ts := mh.timestamp
-		if ts >= 0xffffff {
-			ts = 0xffffff
+		if ts >= extendedTimestampMarker {
+			ts = extendedTimestampMarker
 			ext = true
 			buflen += 4
 		}
@@ -190,8 +206,8 @@ func encodeChunkMessageHeader(w io.Writer, fmt byte, mh *chunkMessageHeader) err
 	case 1:
 		buflen := 7
 		td := mh.timestampDelta
-		if td >= 0xffffff {
-			td = 0xffffff
+		if td >= extendedTimestampMarker {
+			td = extendedTimestampMarker
 			ext = true
 			buflen += 4
 		}
@@ -212,8 +228,8 @@ func encodeChunkMessageHeader(w io.Writer, fmt byte, mh *chunkMessageHeader) err
 	case 2:
 		buflen := 3
 		td := mh.timestampDelta
-		if td >= 0xffffff {
-			td = 0xffffff
+		if td >= extendedTimestampMarker {
+			td = extendedTimestampMarker
 			ext = true
 			buflen += 4
 		}
@@ -235,4 +251,25 @@ func encodeChunkMessageHeader(w io.Writer, fmt byte, mh *chunkMessageHeader) err
 	default:
 		panic("Unexpected fmt")
 	}
+}
+
+// decodeExtendedTimestamp reads a 32bits extended timestamp field (BigEndian).
+func decodeExtendedTimestamp(r io.Reader, buf []byte) (uint32, error) {
+	if buf == nil || len(buf) < 4 {
+		buf = make([]byte, 4)
+	}
+	if _, err := io.ReadAtLeast(r, buf[:4], 4); err != nil {
+		return 0, err
+	}
+
+	return binary.BigEndian.Uint32(buf[:4]), nil
+}
+
+// encodeExtendedTimestamp writes a 32bits extended timestamp field (BigEndian).
+func encodeExtendedTimestamp(w io.Writer, timestamp uint32) error {
+	var buf [4]byte
+	binary.BigEndian.PutUint32(buf[:], timestamp)
+	_, err := w.Write(buf[:]) // TODO: should check length?
+
+	return err
 }

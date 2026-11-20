@@ -21,6 +21,14 @@ type ChunkStreamReader struct {
 	messageTypeID   byte
 	messageStreamID uint32
 
+	// State of the extended timestamp field of the previous chunk on this
+	// chunk stream. A fmt=3 chunk repeats the 32bits extended timestamp
+	// field when the previous chunk carried one, so both the reader and
+	// the writer have to track it per chunk stream to keep the message
+	// timeline consistent.
+	hasExtendedTimestamp bool
+	extendedTimestamp    uint32
+
 	buf       bytes.Buffer
 	completed bool
 }

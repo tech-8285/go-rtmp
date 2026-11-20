@@ -200,16 +200,27 @@ func (cs *ChunkStreamer) readChunk() (*ChunkStreamReader, error) {
 	}
 	//cs.logger.Debugf("(READ) BasicHeader = %+v", bh)
 
+	reader, err := cs.prepareChunkReader(bh.chunkStreamID)
+	if err != nil {
+		return nil, errors.Wrapf(err, "Failed to prepare chunk reader")
+	}
+
 	var mh chunkMessageHeader
 	if err := decodeChunkMessageHeader(cs.r, bh.fmt, cs.cacheBuffer, &mh); err != nil {
 		return nil, err
 	}
 	//cs.logger.Debugf("(READ) MessageHeader = %+v", mh)
 
-	reader, err := cs.prepareChunkReader(bh.chunkStreamID)
-	if err != nil {
-		return nil, errors.Wrapf(err, "Failed to prepare chunk reader")
+	if bh.fmt == 3 && reader.hasExtendedTimestamp {
+		// A fmt=3 chunk carries the 32bits extended timestamp field when
+		// the previous chunk on this chunk stream carried one. Consume it
+		// to keep the stream aligned; the timestamp itself is inherited
+		// from the state of the previous chunk.
+		if _, err := decodeExtendedTimestamp(cs.r, cs.cacheBuffer); err != nil {
+			return nil, err
+		}
 	}
+
 	if reader.completed {
 		reader.buf.Reset()
 		reader.completed = false
@@ -225,17 +236,23 @@ func (cs *ChunkStreamer) readChunk() (*ChunkStreamReader, error) {
 		reader.messageLength = mh.messageLength
 		reader.messageTypeID = mh.messageTypeID
 		reader.messageStreamID = mh.messageStreamID
+		reader.hasExtendedTimestamp = mh.timestamp >= extendedTimestampMarker
+		reader.extendedTimestamp = mh.timestamp
 
 	case 1:
 		reader.timestampDelta = mh.timestampDelta
 		reader.messageLength = mh.messageLength
 		reader.messageTypeID = mh.messageTypeID
+		reader.hasExtendedTimestamp = mh.timestampDelta >= extendedTimestampMarker
+		reader.extendedTimestamp = mh.timestampDelta
 
 	case 2:
 		reader.timestampDelta = mh.timestampDelta
+		reader.hasExtendedTimestamp = mh.timestampDelta >= extendedTimestampMarker
+		reader.extendedTimestamp = mh.timestampDelta
 
 	case 3:
-		// DO NOTHING
+		// DO NOTHING (keep the state of the previous chunk)
 
 	default:
 		panic("unsupported chunk") // TODO: fix
@@ -287,6 +304,26 @@ func (cs *ChunkStreamer) writeChunk(writer *ChunkStreamWriter) (bool, error) {
 	}
 	if err := encodeChunkMessageHeader(cs.w, writer.basicHeader.fmt, &writer.messageHeader); err != nil {
 		return false, err
+	}
+	if writer.basicHeader.fmt == 3 && writer.hasExtendedTimestamp {
+		// A fmt=3 chunk must repeat the extended timestamp field of the
+		// previous chunk on this chunk stream.
+		if err := encodeExtendedTimestamp(cs.w, writer.extendedTimestamp); err != nil {
+			return false, err
+		}
+	}
+
+	// Update the extended timestamp state of this chunk stream for the
+	// following chunks.
+	switch writer.basicHeader.fmt {
+	case 0:
+		writer.hasExtendedTimestamp = writer.messageHeader.timestamp >= extendedTimestampMarker
+		writer.extendedTimestamp = writer.messageHeader.timestamp
+	case 1, 2:
+		writer.hasExtendedTimestamp = writer.messageHeader.timestampDelta >= extendedTimestampMarker
+		writer.extendedTimestamp = writer.messageHeader.timestampDelta
+	case 3:
+		// DO NOTHING (keep the state of the previous chunk)
 	}
 
 	if _, err := io.CopyN(cs.w, writer, int64(expectLen)); err != nil {

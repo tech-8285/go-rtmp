@@ -541,3 +541,301 @@ func BenchmarkStreamerMultipleChunkRead(b *testing.B) {
 		}
 	}
 }
+
+// Wire-level sequence which alternates extended timestamps and fmt=3 headers.
+// fmt=3 chunks repeat the extended timestamp field of the previous chunk on
+// the same chunk stream (RTMP spec 5.3.1.3).
+//
+// chunk stream 6:
+//
+//	msg1: ts=0x01000000, len=200 (fragmented: 128 + 72)
+//	msg2: ts=0x03000000 (delta=0x02000000), len=4
+//	msg3: ts=0x05000000 (delta=0x02000000), len=4
+func extendedTimestampWireBytes() []byte {
+	var b []byte
+
+	payload1 := append(bytes.Repeat([]byte{0xaa}, 128), bytes.Repeat([]byte{0xbb}, 72)...)
+
+	// msg1, chunk1: fmt=0, csid=6, ts=0xffffff(marker), len=200, type=9, msid=1, ext=0x01000000
+	b = append(b, 0x06)
+	b = append(b, 0xff, 0xff, 0xff)       // timestamp marker
+	b = append(b, 0x00, 0x00, 0xc8)       // message length = 200
+	b = append(b, 0x09)                   // message type id
+	b = append(b, 0x01, 0x00, 0x00, 0x00) // message stream id (LE)
+	b = append(b, 0x01, 0x00, 0x00, 0x00) // extended timestamp
+	b = append(b, payload1[:128]...)      // payload (fragment 1)
+
+	// msg1, chunk2: fmt=3, csid=6, ext=0x01000000 (repeated)
+	b = append(b, 0xc6)
+	b = append(b, 0x01, 0x00, 0x00, 0x00) // extended timestamp
+	b = append(b, payload1[128:]...)      // payload (fragment 2)
+
+	// msg2: fmt=1, csid=6, delta=0xffffff(marker), len=4, type=9, ext=0x02000000
+	b = append(b, 0x46)
+	b = append(b, 0xff, 0xff, 0xff)       // timestamp delta marker
+	b = append(b, 0x00, 0x00, 0x04)       // message length = 4
+	b = append(b, 0x09)                   // message type id
+	b = append(b, 0x02, 0x00, 0x00, 0x00) // extended timestamp delta
+	b = append(b, 0xcc, 0xcc, 0xcc, 0xcc) // payload
+
+	// msg3: fmt=3, csid=6, ext=0x02000000 (repeated)
+	b = append(b, 0xc6)
+	b = append(b, 0x02, 0x00, 0x00, 0x00) // extended timestamp delta
+	b = append(b, 0xdd, 0xdd, 0xdd, 0xdd) // payload
+
+	return b
+}
+
+func TestStreamerReadExtendedTimestampWithFmt3(t *testing.T) {
+	wire := extendedTimestampWireBytes()
+	inbuf := bufio.NewReader(bytes.NewReader(wire))
+	outbuf := bufio.NewWriterSize(ioutil.Discard, 2048)
+
+	streamer := NewChunkStreamer(inbuf, outbuf, nil)
+	defer streamer.Close()
+
+	// msg1, fragment 1
+	r, err := streamer.readChunk()
+	require.Nil(t, err)
+	require.False(t, r.completed)
+	require.Equal(t, uint32(0x01000000), r.timestamp)
+
+	// msg1, fragment 2 (fmt=3 with extended timestamp)
+	r, err = streamer.readChunk()
+	require.Nil(t, err)
+	require.True(t, r.completed)
+	require.Equal(t, uint32(0x01000000), r.timestamp)
+	require.Equal(t, 200, r.buf.Len())
+	require.Equal(t, bytes.Repeat([]byte{0xaa}, 128), r.buf.Bytes()[:128])
+	require.Equal(t, bytes.Repeat([]byte{0xbb}, 72), r.buf.Bytes()[128:])
+
+	// msg2 (fmt=2 with extended timestamp delta)
+	r, err = streamer.readChunk()
+	require.Nil(t, err)
+	require.True(t, r.completed)
+	require.Equal(t, uint32(0x03000000), r.timestamp)
+	require.Equal(t, uint32(0x02000000), r.timestampDelta)
+	require.Equal(t, []byte{0xcc, 0xcc, 0xcc, 0xcc}, r.buf.Bytes())
+
+	// msg3 (fmt=3 with extended timestamp delta, delta is inherited)
+	r, err = streamer.readChunk()
+	require.Nil(t, err)
+	require.True(t, r.completed)
+	require.Equal(t, uint32(0x05000000), r.timestamp)
+	require.Equal(t, uint32(0x02000000), r.timestampDelta)
+	require.Equal(t, []byte{0xdd, 0xdd, 0xdd, 0xdd}, r.buf.Bytes())
+}
+
+func TestStreamerWriteExtendedTimestampWithFmt3(t *testing.T) {
+	buf := bytes.NewBuffer(make([]byte, 0, 2048))
+	inbuf := bufio.NewReaderSize(buf, 2048)
+	outbuf := bufio.NewWriterSize(buf, 2048)
+
+	streamer := NewChunkStreamer(inbuf, outbuf, nil)
+	defer streamer.Close()
+
+	chunkStreamID := 6
+	payload1 := append(bytes.Repeat([]byte{0xaa}, 128), bytes.Repeat([]byte{0xbb}, 72)...)
+
+	writeCases := []struct {
+		timestamp uint32
+		payload   []byte
+	}{
+		{timestamp: 0x01000000, payload: payload1},
+		{timestamp: 0x03000000, payload: []byte{0xcc, 0xcc, 0xcc, 0xcc}},
+		{timestamp: 0x05000000, payload: []byte{0xdd, 0xdd, 0xdd, 0xdd}},
+	}
+
+	for _, wc := range writeCases {
+		w, err := streamer.NewChunkWriter(context.Background(), chunkStreamID)
+		require.Nil(t, err)
+
+		w.messageLength = uint32(len(wc.payload))
+		w.messageTypeID = 9
+		w.messageStreamID = 1
+		w.timestamp = wc.timestamp
+		w.buf.Write(wc.payload)
+
+		err = streamer.Sched(w)
+		require.Nil(t, err)
+	}
+
+	_, err := streamer.NewChunkWriter(context.Background(), chunkStreamID) // wait for writing
+	require.Nil(t, err)
+
+	// The writer must emit the same wire format as a spec-compliant peer:
+	// fmt=3 chunks repeat the extended timestamp field.
+	expected := extendedTimestampWireBytes()
+	require.Equal(t, expected, buf.Bytes())
+}
+
+func TestStreamerReadInterleavedChunkStreamsExtendedTimestamp(t *testing.T) {
+	var wire []byte
+
+	// csid 6, msg1: fmt=0, ts=0x01000000(ext), len=200 -> fragmented
+	wire = append(wire, 0x06)
+	wire = append(wire, 0xff, 0xff, 0xff)
+	wire = append(wire, 0x00, 0x00, 0xc8)
+	wire = append(wire, 0x09)
+	wire = append(wire, 0x01, 0x00, 0x00, 0x00)
+	wire = append(wire, 0x01, 0x00, 0x00, 0x00) // ext
+	wire = append(wire, bytes.Repeat([]byte{0xaa}, 128)...)
+
+	// csid 7, msg1: fmt=0, ts=100, len=4 (no ext)
+	wire = append(wire, 0x07)
+	wire = append(wire, 0x00, 0x00, 0x64)
+	wire = append(wire, 0x00, 0x00, 0x04)
+	wire = append(wire, 0x09)
+	wire = append(wire, 0x01, 0x00, 0x00, 0x00)
+	wire = append(wire, 0x71, 0x71, 0x71, 0x71)
+
+	// csid 6, msg1 fragment 2: fmt=3, ext repeated
+	wire = append(wire, 0xc6)
+	wire = append(wire, 0x01, 0x00, 0x00, 0x00) // ext
+	wire = append(wire, bytes.Repeat([]byte{0xbb}, 72)...)
+
+	// csid 7, msg2: fmt=2, delta=40 (no ext)
+	wire = append(wire, 0x87)
+	wire = append(wire, 0x00, 0x00, 0x28)
+	wire = append(wire, 0x72, 0x72, 0x72, 0x72)
+
+	// csid 6, msg2: fmt=1, delta=0x01000000(ext), len=4
+	wire = append(wire, 0x46)
+	wire = append(wire, 0xff, 0xff, 0xff)
+	wire = append(wire, 0x00, 0x00, 0x04)
+	wire = append(wire, 0x09)
+	wire = append(wire, 0x01, 0x00, 0x00, 0x00) // ext
+	wire = append(wire, 0xcc, 0xcc, 0xcc, 0xcc)
+
+	// csid 7, msg3: fmt=3, delta inherited (no ext)
+	wire = append(wire, 0xc7)
+	wire = append(wire, 0x73, 0x73, 0x73, 0x73)
+
+	// csid 6, msg3: fmt=3, ext repeated
+	wire = append(wire, 0xc6)
+	wire = append(wire, 0x01, 0x00, 0x00, 0x00) // ext
+	wire = append(wire, 0xdd, 0xdd, 0xdd, 0xdd)
+
+	inbuf := bufio.NewReader(bytes.NewReader(wire))
+	outbuf := bufio.NewWriterSize(ioutil.Discard, 2048)
+
+	streamer := NewChunkStreamer(inbuf, outbuf, nil)
+	defer streamer.Close()
+
+	type expectation struct {
+		chunkStreamID int
+		timestamp     uint32
+		completed     bool
+	}
+	expectations := []expectation{
+		{chunkStreamID: 6, timestamp: 0x01000000, completed: false},
+		{chunkStreamID: 7, timestamp: 100, completed: true},
+		{chunkStreamID: 6, timestamp: 0x01000000, completed: true},
+		{chunkStreamID: 7, timestamp: 140, completed: true},
+		{chunkStreamID: 6, timestamp: 0x02000000, completed: true},
+		{chunkStreamID: 7, timestamp: 180, completed: true},
+		{chunkStreamID: 6, timestamp: 0x03000000, completed: true},
+	}
+
+	for i, exp := range expectations {
+		r, err := streamer.readChunk()
+		require.Nil(t, err, "case %d", i)
+		require.Equal(t, exp.chunkStreamID, r.basicHeader.chunkStreamID, "case %d", i)
+		require.Equal(t, exp.timestamp, r.timestamp, "case %d", i)
+		require.Equal(t, exp.completed, r.completed, "case %d", i)
+	}
+}
+
+func TestStreamerReadInvalidExtendedTimestamp(t *testing.T) {
+	t.Run("fmt 0", func(t *testing.T) {
+		var wire []byte
+		wire = append(wire, 0x06)
+		wire = append(wire, 0xff, 0xff, 0xff)       // timestamp marker
+		wire = append(wire, 0x00, 0x00, 0x04)       // message length = 4
+		wire = append(wire, 0x09)                   // message type id
+		wire = append(wire, 0x01, 0x00, 0x00, 0x00) // message stream id (LE)
+		wire = append(wire, 0x00, 0x00, 0x00, 0x10) // invalid extended timestamp (< marker)
+
+		streamer := NewChunkStreamer(bufio.NewReader(bytes.NewReader(wire)), nil, nil)
+		defer streamer.Close()
+
+		_, err := streamer.readChunk()
+		require.EqualError(t, err, "Invalid extended timestamp: 16")
+	})
+
+	t.Run("fmt 1", func(t *testing.T) {
+		var wire []byte
+		wire = append(wire, 0x46)
+		wire = append(wire, 0xff, 0xff, 0xff)       // timestamp delta marker
+		wire = append(wire, 0x00, 0x00, 0x04)       // message length = 4
+		wire = append(wire, 0x09)                   // message type id
+		wire = append(wire, 0x00, 0x00, 0x00, 0x10) // invalid extended timestamp delta (< marker)
+
+		streamer := NewChunkStreamer(bufio.NewReader(bytes.NewReader(wire)), nil, nil)
+		defer streamer.Close()
+
+		_, err := streamer.readChunk()
+		require.EqualError(t, err, "Invalid extended timestamp delta: 16")
+	})
+
+	t.Run("fmt 2", func(t *testing.T) {
+		var wire []byte
+		wire = append(wire, 0x86)
+		wire = append(wire, 0xff, 0xff, 0xff)       // timestamp delta marker
+		wire = append(wire, 0x00, 0x00, 0x00, 0x10) // invalid extended timestamp delta (< marker)
+
+		streamer := NewChunkStreamer(bufio.NewReader(bytes.NewReader(wire)), nil, nil)
+		defer streamer.Close()
+
+		_, err := streamer.readChunk()
+		require.EqualError(t, err, "Invalid extended timestamp delta: 16")
+	})
+}
+
+func TestStreamerTimestampWrapAround(t *testing.T) {
+	buf := bytes.NewBuffer(make([]byte, 0, 2048))
+	inbuf := bufio.NewReaderSize(buf, 2048)
+	outbuf := bufio.NewWriterSize(buf, 2048)
+
+	streamer := NewChunkStreamer(inbuf, outbuf, nil)
+	defer streamer.Close()
+
+	chunkStreamID := 6
+	writeCases := []struct {
+		timestamp uint32
+		fmt       byte
+	}{
+		// huge delta requires the extended timestamp field
+		{timestamp: 0xfffffff0, fmt: 0},
+		// wrapped timestamp goes back: resets to fmt=0 with an absolute timestamp
+		{timestamp: 0x00000010, fmt: 0},
+		// continue normally from the new absolute timestamp
+		{timestamp: 0x00000030, fmt: 2},
+		{timestamp: 0x00000050, fmt: 3},
+	}
+
+	for _, wc := range writeCases {
+		w, err := streamer.NewChunkWriter(context.Background(), chunkStreamID)
+		require.Nil(t, err)
+
+		w.messageLength = 4
+		w.messageTypeID = 9
+		w.messageStreamID = 1
+		w.timestamp = wc.timestamp
+		w.buf.Write([]byte{0x01, 0x02, 0x03, 0x04})
+
+		err = streamer.Sched(w)
+		require.Nil(t, err)
+	}
+
+	_, err := streamer.NewChunkWriter(context.Background(), chunkStreamID) // wait for writing
+	require.Nil(t, err)
+
+	for i, wc := range writeCases {
+		r, err := streamer.readChunk()
+		require.Nil(t, err, "case %d", i)
+		require.True(t, r.completed, "case %d", i)
+		require.Equal(t, wc.fmt, r.basicHeader.fmt, "case %d", i)
+		require.Equal(t, wc.timestamp, r.timestamp, "case %d", i)
+	}
+}
