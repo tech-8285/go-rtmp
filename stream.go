@@ -10,6 +10,7 @@ package rtmp
 import (
 	"bytes"
 	"context"
+	"sync"
 	"time"
 
 	"github.com/pkg/errors"
@@ -27,6 +28,14 @@ type Stream struct {
 	cmsg         ChunkMessage
 
 	conn *Conn
+
+	// statusCh delivers onStatus notifications received on this stream.
+	// It is buffered so that the message loop never blocks even when nobody
+	// is waiting (for example while publishing). Every stream owns its own
+	// channel, therefore notifications of multiple streams on the same
+	// connection can never be mixed.
+	statusCh  chan *message.NetStreamOnStatus
+	closeOnce sync.Once
 }
 
 func newStream(streamID uint32, conn *Conn) *Stream {
@@ -39,6 +48,8 @@ func newStream(streamID uint32, conn *Conn) *Stream {
 		},
 
 		conn: conn,
+
+		statusCh: make(chan *message.NetStreamOnStatus, 16),
 	}
 	s.handler = newStreamHandler(s)
 
@@ -234,6 +245,13 @@ func (s *Stream) Publish(
 		body = &message.NetStreamPublish{}
 	}
 
+	// A freshly created data stream is in the client-inactive state. Move it
+	// to the publishing state before the command is sent so that the server's
+	// onStatus response is handled by the publish handler.
+	if s.handler.State() == streamStateClientInactive {
+		s.handler.ChangeState(streamStateClientPublish)
+	}
+
 	chunkStreamID := 3 // TODO: fix
 	return s.writeCommandMessage(
 		chunkStreamID, 0, // TODO: fix, Timestamp is 0
@@ -241,6 +259,167 @@ func (s *Stream) Publish(
 		int64(0), // Always 0, 7.2.2.6
 		body,
 	)
+}
+
+// DefaultPlayStatusTimeout is the maximum time Play waits for the server's
+// start/failed onStatus notification.
+const DefaultPlayStatusTimeout = 30 * time.Second
+
+// Play sends a play request for body.StreamName on this message stream and
+// blocks until the server accepts or rejects the request.
+// On success the stream is in the playing state and audio, video and metadata
+// messages are delivered, with their original timestamps, through the Handler
+// callbacks until the stream ends or the connection is closed.
+func (s *Stream) Play(body *message.NetStreamPlay) (*message.NetStreamOnStatus, error) {
+	return s.PlayWithTimeout(body, DefaultPlayStatusTimeout)
+}
+
+// PlayWithTimeout is Play with an explicit deadline for waiting on the
+// server's play status notification. A timeout of zero disables the deadline.
+func (s *Stream) PlayWithTimeout(
+	body *message.NetStreamPlay,
+	timeout time.Duration,
+) (*message.NetStreamOnStatus, error) {
+	if body == nil {
+		body = &message.NetStreamPlay{}
+	}
+
+	// Enter the inactive state first so that the response to the play command
+	// is routed to a handler which understands onStatus messages.
+	if s.handler.State() != streamStateClientInactive &&
+		s.handler.State() != streamStateClientPlay {
+		s.handler.ChangeState(streamStateClientInactive)
+	}
+
+	// Discard notifications left over from a previous (possibly timed out)
+	// attempt so that this call waits for its own response.
+	s.drainPlayStatus()
+
+	chunkStreamID := 4 // Data/commands of a playing stream use chunk stream 4
+	if err := s.writeCommandMessage(
+		chunkStreamID, 0, // Timestamp is 0 for commands
+		"play",
+		int64(0), // Always 0, 7.2.2.1
+		body,
+	); err != nil {
+		return nil, err
+	}
+
+	// Optimistically enter the playing state. A server is allowed to start
+	// delivering media before (or without) the Play.Start onStatus
+	// notification, therefore the stream must already route audio, video and
+	// metadata to the play handler. On rejection the state is rolled back.
+	s.handler.ChangeState(streamStateClientPlay)
+
+	status, err := s.waitPlayStatus(timeout)
+	if err != nil {
+		s.handler.ChangeState(streamStateClientInactive)
+		return nil, err
+	}
+
+	if status.InfoObject.Level == message.NetStreamOnStatusLevelError ||
+		status.InfoObject.Code == message.NetStreamOnStatusCodePlayFailed ||
+		status.InfoObject.Code == message.NetStreamOnStatusCodeConnectFailed {
+		// Rejected: return to inactive so that callers can retry on a fresh
+		// stream after cleaning up.
+		s.handler.ChangeState(streamStateClientInactive)
+		return nil, &PlayRejectedError{
+			StreamID: s.streamID,
+			Status:   status,
+		}
+	}
+
+	// Accepted: media is delivered on this same message stream. Make sure the
+	// play state is active even when the handler was changed concurrently.
+	s.handler.ChangeState(streamStateClientPlay)
+
+	return status, nil
+}
+
+// CloseStream sends closeStream to release the server-side resources bound to
+// this message stream and removes the stream locally. It is the cleanup step
+// required before reconnecting or reusing the stream name. Local cleanup is
+// performed even when the network write fails (for example a dead connection).
+func (s *Stream) CloseStream() error {
+	chunkStreamID := 4
+
+	writeErr := s.writeCommandMessage(
+		chunkStreamID, 0,
+		"closeStream",
+		int64(0),
+		&message.NetStreamCloseStream{},
+	)
+
+	if err := s.conn.streams.Delete(s.streamID); err != nil && writeErr == nil {
+		return err
+	}
+
+	return writeErr
+}
+
+// notifyPlayStatus enqueues an onStatus notification for this stream. The
+// message loop calls it; Play consumes the notification via waitPlayStatus.
+func (s *Stream) notifyPlayStatus(status *message.NetStreamOnStatus) {
+	defer func() {
+		// The channel can be closed concurrently when the stream is deleted
+		// (CloseStream). A late notification is simply discarded in that case.
+		_ = recover()
+	}()
+
+	select {
+	case s.statusCh <- status:
+	default:
+		// Drop the oldest notification rather than blocking the message loop
+		// when the buffer is full.
+		select {
+		case <-s.statusCh:
+		default:
+		}
+		s.statusCh <- status
+	}
+}
+
+// handlePlayPublishStatus is the single entry point used by every client data
+// handler when an onStatus command is received.
+func (s *Stream) handlePlayPublishStatus(status *message.NetStreamOnStatus) error {
+	s.notifyPlayStatus(status)
+	return nil
+}
+
+func (s *Stream) waitPlayStatus(timeout time.Duration) (*message.NetStreamOnStatus, error) {
+	var timeoutCh <-chan time.Time
+	if timeout > 0 {
+		timer := time.NewTimer(timeout)
+		defer timer.Stop()
+		timeoutCh = timer.C
+	}
+
+	select {
+	case status, ok := <-s.statusCh:
+		if !ok {
+			return nil, errors.New("Stream is closed while waiting for play status")
+		}
+		return status, nil
+	case <-s.conn.Done():
+		return nil, errors.New("Connection is closed while waiting for play status")
+	case <-timeoutCh:
+		return nil, errors.Errorf("Timed out waiting for play status: Timeout = %s", timeout)
+	}
+}
+
+// drainPlayStatus removes any buffered notifications. It never blocks and
+// tolerates a closed channel.
+func (s *Stream) drainPlayStatus() {
+	for {
+		select {
+		case _, ok := <-s.statusCh:
+			if !ok {
+				return
+			}
+		default:
+			return
+		}
+	}
 }
 
 func (s *Stream) NotifyStatus(
@@ -262,7 +441,15 @@ func (s *Stream) Close() error {
 }
 
 func (s *Stream) assumeClosed() {
-	// TODO: implement
+	if s == nil || s.conn == nil {
+		return
+	}
+
+	// Unblock Play which may be waiting for a status notification that will
+	// never arrive once the stream is gone.
+	s.closeOnce.Do(func() {
+		close(s.statusCh)
+	})
 }
 
 func (s *Stream) writeCommandMessage(

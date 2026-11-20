@@ -42,3 +42,19 @@ func (err *CreateStreamRejectedError) Error() string {
 		err.Result,
 	)
 }
+
+// PlayRejectedError is returned by Stream.Play when a server replies to a play
+// request with an error-level onStatus notification (for example
+// NetStream.Play.Failed).
+type PlayRejectedError struct {
+	StreamID uint32
+	Status   *message.NetStreamOnStatus
+}
+
+func (err *PlayRejectedError) Error() string {
+	return fmt.Sprintf(
+		"Play is rejected: StreamID = %d, Status = %#v",
+		err.StreamID,
+		err.Status,
+	)
+}

@@ -80,6 +80,8 @@ func (cc *ClientConn) Connect(body *message.NetConnectionConnect) error {
 	// TODO: check result
 	_ = result
 
+	stream.handler.ChangeState(streamStateClientConnected)
+
 	return nil
 }
 
@@ -104,6 +106,11 @@ func (cc *ClientConn) CreateStream(body *message.NetConnectionCreateStream, chun
 	if err != nil {
 		return nil, err
 	}
+	// Data streams start in the client-inactive state: Play/Publish move them
+	// to the corresponding state and onStatus responses are then handled
+	// correctly (previously the handler was nil and the first server message
+	// panicked).
+	newStream.handler.ChangeState(streamStateClientInactive)
 
 	return newStream, nil
 }

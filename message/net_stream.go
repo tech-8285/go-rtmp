@@ -7,6 +7,12 @@
 
 package message
 
+import (
+	"github.com/mitchellh/mapstructure"
+	"github.com/pkg/errors"
+	"github.com/yutopp/go-amf0"
+)
+
 type NetStreamPublish struct {
 	CommandObject  interface{}
 	PublishingName string
@@ -44,7 +50,11 @@ func (t *NetStreamPlay) FromArgs(args ...interface{}) error {
 }
 
 func (t *NetStreamPlay) ToArgs(ty EncodingType) ([]interface{}, error) {
-	panic("Not implemented")
+	return []interface{}{
+		nil, // Always nil
+		t.StreamName,
+		t.Start,
+	}, nil
 }
 
 type NetStreamOnStatusLevel string
@@ -80,7 +90,29 @@ type NetStreamOnStatusInfoObject struct {
 }
 
 func (t *NetStreamOnStatus) FromArgs(args ...interface{}) error {
-	panic("Not implemented")
+	// args[0] is a command object (usually nil) and args[1] is an info object.
+	// It tolerates missing arguments because some servers send simplified messages.
+	if len(args) < 2 {
+		return errors.Errorf("onStatus requires an info object, but args = %#v", args)
+	}
+
+	// AMF0 objects decode to map[string]interface{} while ECMA arrays decode
+	// to amf0.ECMAArray; both carry the level/code/description fields.
+	var info map[string]interface{}
+	switch v := args[1].(type) {
+	case map[string]interface{}:
+		info = v
+	case amf0.ECMAArray:
+		info = v
+	default:
+		return errors.Errorf("Failed to reconstruct 'onStatus': unexpected info type = %T", args[1])
+	}
+
+	if err := mapstructure.Decode(info, &t.InfoObject); err != nil {
+		return errors.Wrap(err, "Failed to mapping NetStreamOnStatusInfoObject")
+	}
+
+	return nil
 }
 
 func (t *NetStreamOnStatus) ToArgs(ty EncodingType) ([]interface{}, error) {

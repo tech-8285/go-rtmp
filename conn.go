@@ -36,6 +36,7 @@ type Conn struct {
 
 	m        sync.Mutex
 	isClosed bool
+	closeCh  chan struct{}
 }
 
 type ConnConfig struct {
@@ -95,6 +96,8 @@ func newConn(rwc io.ReadWriteCloser, config *ConnConfig) *Conn {
 
 		config: config,
 		logger: config.Logger,
+
+		closeCh: make(chan struct{}),
 	}
 
 	conn.streamer = NewChunkStreamer(conn.bufr, conn.bufw, &conn.config.ControlState)
@@ -117,6 +120,7 @@ func (c *Conn) Close() error {
 		return nil
 	}
 	c.isClosed = true
+	close(c.closeCh)
 
 	if c.handler != nil {
 		c.handler.OnClose()
@@ -135,6 +139,12 @@ func (c *Conn) Close() error {
 	}
 
 	return result
+}
+
+// Done returns a channel which is closed when the connection is closed.
+// It is used to abort operations which wait for messages from a peer.
+func (c *Conn) Done() <-chan struct{} {
+	return c.closeCh
 }
 
 func (c *Conn) Write(ctx context.Context, chunkStreamID int, timestamp uint32, cmsg *ChunkMessage) error {

@@ -28,6 +28,9 @@ const (
 	streamStateServerPlay
 	streamStateClientNotConnected
 	streamStateClientConnected
+	streamStateClientInactive
+	streamStateClientPublish
+	streamStateClientPlay
 )
 
 func (s streamState) String() string {
@@ -46,6 +49,12 @@ func (s streamState) String() string {
 		return "NotConnected(Client)"
 	case streamStateClientConnected:
 		return "Connected(Client)"
+	case streamStateClientInactive:
+		return "Inactive(Client)"
+	case streamStateClientPublish:
+		return "Publish(Client)"
+	case streamStateClientPlay:
+		return "Play(Client)"
 	default:
 		return "<Unknown>"
 	}
@@ -101,7 +110,7 @@ func (h *streamHandler) ChangeState(state streamState) {
 	h.m.Lock()
 	defer h.m.Unlock()
 
-	prevState := h.State()
+	prevState := h.state
 
 	switch state {
 	case streamStateUnknown:
@@ -118,29 +127,48 @@ func (h *streamHandler) ChangeState(state streamState) {
 		h.handler = &serverDataPlayHandler{sh: h}
 	case streamStateClientNotConnected:
 		h.handler = &clientControlNotConnectedHandler{sh: h}
-		// 	case streamStateClientConnected:
-		// 		h.handler = &serverControlConnectedHandler{sh: h}
+	case streamStateClientConnected:
+		h.handler = &clientControlConnectedHandler{sh: h}
+	case streamStateClientInactive:
+		h.handler = &clientDataInactiveHandler{sh: h}
+	case streamStateClientPublish:
+		h.handler = &clientDataPublishHandler{sh: h}
+	case streamStateClientPlay:
+		h.handler = &clientDataPlayHandler{sh: h}
 	default:
 		panic("Unexpected")
 	}
 	h.state = state
 
-	l := h.Logger()
-	l.Infof("Change state: From = %s, To = %s", prevState, h.State())
+	l := h.loggerLocked()
+	l.Infof("Change state: From = %s, To = %s", prevState, h.state)
 }
 
+// State returns the current state. It is safe to call concurrently with
+// ChangeState.
 func (h *streamHandler) State() streamState {
+	h.m.Lock()
+	defer h.m.Unlock()
+
 	return h.state
 }
 
 func (h *streamHandler) Logger() *logrus.Entry {
+	h.m.Lock()
+	defer h.m.Unlock()
+
+	return h.loggerLocked()
+}
+
+// loggerLocked builds the logger entry. The caller must hold h.m.
+func (h *streamHandler) loggerLocked() *logrus.Entry {
 	if h.loggerEntry == nil {
 		h.loggerEntry = h.stream.logger().WithFields(logrus.Fields{
 			"stream_id": h.stream.streamID,
 		})
 	}
 
-	h.loggerEntry.Data["state"] = h.State()
+	h.loggerEntry.Data["state"] = h.state
 
 	return h.loggerEntry
 }

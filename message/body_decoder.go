@@ -18,6 +18,7 @@ type BodyDecoderFunc func(r io.Reader, e AMFDecoder, v *AMFConvertible) error
 
 var DataBodyDecoders = map[string]BodyDecoderFunc{
 	"@setDataFrame": DecodeBodyAtSetDataFrame,
+	"onMetaData":    DecodeBodyOnMetaData,
 }
 
 func DataBodyDecoderFor(name string) BodyDecoderFunc {
@@ -59,12 +60,40 @@ func DecodeBodyAtSetDataFrame(r io.Reader, _ AMFDecoder, v *AMFConvertible) erro
 	return nil
 }
 
+// DecodeBodyOnMetaData decodes a data message whose name is "onMetaData".
+// The message layout is: [onMetaData] [metadata object] (AMF0).
+// The decoded object is kept in AmfData and the raw AMF payload is kept in
+// Payload so that callers can re-encode or inspect it without losing data.
+func DecodeBodyOnMetaData(r io.Reader, d AMFDecoder, v *AMFConvertible) error {
+	buf := new(bytes.Buffer)
+	if _, err := io.Copy(buf, r); err != nil {
+		return errors.Wrap(err, "Failed to read 'onMetaData' body")
+	}
+
+	argDec := d
+	argDec.Reset(bytes.NewReader(buf.Bytes()))
+
+	var metadata interface{}
+	if err := argDec.Decode(&metadata); err != nil {
+		return errors.Wrap(err, "Failed to decode 'onMetaData' args[0]")
+	}
+
+	cmd := &NetStreamSetDataFrame{
+		Payload: buf.Bytes(),
+		AmfData: metadata,
+	}
+
+	*v = cmd
+	return nil
+}
+
 var CmdBodyDecoders = map[string]BodyDecoderFunc{
 	"connect":         DecodeBodyConnect,
 	"createStream":    DecodeBodyCreateStream,
 	"deleteStream":    DecodeBodyDeleteStream,
 	"publish":         DecodeBodyPublish,
 	"play":            DecodeBodyPlay,
+	"onStatus":        DecodeBodyOnStatus,
 	"releaseStream":   DecodeBodyReleaseStream,
 	"FCPublish":       DecodeBodyFCPublish,
 	"FCUnpublish":     DecodeBodyFCUnpublish,
@@ -242,6 +271,31 @@ func DecodeBodyPlay(_ io.Reader, d AMFDecoder, v *AMFConvertible) error {
 	var cmd NetStreamPlay
 	if err := cmd.FromArgs(commandObject, streamName, start); err != nil {
 		return errors.Wrap(err, "Failed to reconstruct 'play'")
+	}
+
+	*v = &cmd
+	return nil
+}
+
+// DecodeBodyOnStatus decodes a "onStatus" command sent by a server.
+// The message layout is: [onStatus] [transactionID(=0)] [command object(nil)] [info object] (AMF0).
+func DecodeBodyOnStatus(_ io.Reader, d AMFDecoder, v *AMFConvertible) error {
+	var commandObject interface{} // usually nil
+	if err := d.Decode(&commandObject); err != nil {
+		if errors.Is(err, io.EOF) {
+			return errors.Wrap(err, "Failed to decode 'onStatus' args[0]")
+		}
+		return errors.Wrap(err, "Failed to decode 'onStatus' args[0]")
+	}
+
+	var infoObject interface{}
+	if err := d.Decode(&infoObject); err != nil {
+		return errors.Wrap(err, "Failed to decode 'onStatus' args[1]")
+	}
+
+	var cmd NetStreamOnStatus
+	if err := cmd.FromArgs(commandObject, infoObject); err != nil {
+		return errors.Wrap(err, "Failed to reconstruct 'onStatus'")
 	}
 
 	*v = &cmd
