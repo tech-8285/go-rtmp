@@ -175,9 +175,47 @@ func (m *CommandMessage) TypeID() TypeID {
 }
 
 // AggregateMessage (22)
+//
+// An aggregate message bundles several sub-messages (audio, video and script
+// data) into a single message. Each sub-message keeps its own type, message
+// stream ID, timestamp and payload, and must be delivered as if it was sent
+// independently.
 type AggregateMessage struct {
+	// SubMessages are the sub-messages contained in the aggregate message,
+	// in the same order as they appear in the message body.
+	SubMessages []AggregateSubMessage
+}
+
+// TimestampAt returns the timestamp of the i-th sub-message converted onto the
+// timeline of the stream which carries the aggregate message.
+//
+// Sub-message timestamps are relative to the first sub-message, so they are
+// rebased onto the timestamp of the aggregate message itself. This is stable
+// across multiple aggregate messages because each one is rebased by its own
+// base timestamp.
+func (m *AggregateMessage) TimestampAt(baseTimestamp uint32, i int) uint32 {
+	if i < 0 || i >= len(m.SubMessages) {
+		return baseTimestamp
+	}
+
+	return baseTimestamp + (m.SubMessages[i].Timestamp - m.SubMessages[0].Timestamp)
 }
 
 func (m *AggregateMessage) TypeID() TypeID {
 	return TypeIDAggregateMessage
+}
+
+// AggregateSubMessage is a single sub-message embedded in an AggregateMessage.
+type AggregateSubMessage struct {
+	// Message is the decoded sub-message. Its payload is backed by an
+	// independent buffer, so it can be read safely after the aggregate message
+	// has been consumed.
+	Message Message
+
+	// Timestamp is the raw timestamp carried by the sub-message. It is
+	// relative to the first sub-message of the aggregate.
+	Timestamp uint32
+
+	// StreamID is the message stream ID carried by the sub-message.
+	StreamID uint32
 }

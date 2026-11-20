@@ -141,5 +141,54 @@ var testCases = []testCase{
 			0x74, 0x65, 0x73, 0x74,
 		},
 	},
-	// TODO: TypeIDAggregateMessage
+	{
+		Name:   "AggregateMessage",
+		TypeID: TypeIDAggregateMessage,
+		Value: &AggregateMessage{
+			SubMessages: []AggregateSubMessage{
+				{
+					Message: &AudioMessage{
+						Payload: bytes.NewReader([]byte("audio data")),
+					},
+					Timestamp: 0x01000010,
+				},
+				{
+					Message: &VideoMessage{
+						Payload: bytes.NewReader([]byte("video data")),
+					},
+					Timestamp: 0x01000030,
+					StreamID:  42,
+				},
+			},
+		},
+		Binary: []byte{
+			// Audio tag
+			// TagType = 8
+			0x08,
+			// DataSize = 10 (24bits, BigEndian)
+			0x00, 0x00, 0x0a,
+			// Timestamp = 0x01000010 (lower 24bits + upper 8bits)
+			0x00, 0x00, 0x10, 0x01,
+			// StreamID = 0 (24bits, BigEndian)
+			0x00, 0x00, 0x00,
+			// Payload: "audio data"
+			0x61, 0x75, 0x64, 0x69, 0x6f, 0x20, 0x64, 0x61, 0x74, 0x61,
+			// PreviousTagSize = 11 + 10
+			0x00, 0x00, 0x00, 0x15,
+
+			// Video tag
+			// TagType = 9
+			0x09,
+			// DataSize = 10 (24bits, BigEndian)
+			0x00, 0x00, 0x0a,
+			// Timestamp = 0x01000030 (lower 24bits + upper 8bits)
+			0x00, 0x00, 0x30, 0x01,
+			// StreamID = 42 (24bits, BigEndian)
+			0x00, 0x00, 0x2a,
+			// Payload: "video data"
+			0x76, 0x69, 0x64, 0x65, 0x6f, 0x20, 0x64, 0x61, 0x74, 0x61,
+			// PreviousTagSize = 11 + 10
+			0x00, 0x00, 0x00, 0x15,
+		},
+	},
 }

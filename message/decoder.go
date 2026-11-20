@@ -11,6 +11,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"io"
+	"io/ioutil"
 
 	"github.com/pkg/errors"
 
@@ -224,7 +225,26 @@ func (dec *Decoder) decodeCommandMessageAMF0(msg *Message) error {
 }
 
 func (dec *Decoder) decodeAggregateMessage(msg *Message) error {
-	return fmt.Errorf("Not implemented: AggregateMessage")
+	// An aggregate message consists of a sequence of self-delimiting
+	// sub-messages, so the whole body must be available before it can be
+	// split. The reader is bounded by the aggregate message length by the
+	// caller (chunk streamer), so reading it to EOF never consumes bytes of a
+	// following message.
+	body, err := ioutil.ReadAll(dec.r)
+	if err != nil {
+		return errors.Wrap(err, "Failed to read body of AggregateMessage")
+	}
+
+	subMessages, err := decodeAggregateBody(body)
+	if err != nil {
+		return err
+	}
+
+	*msg = &AggregateMessage{
+		SubMessages: subMessages,
+	}
+
+	return nil
 }
 
 func (dec *Decoder) decodeDataMessage(msg *Message, f func(r io.Reader) (AMFDecoder, EncodingType)) error {

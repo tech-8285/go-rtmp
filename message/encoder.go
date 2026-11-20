@@ -11,6 +11,8 @@ import (
 	"encoding/binary"
 	"fmt"
 	"io"
+
+	"github.com/pkg/errors"
 )
 
 type Encoder struct {
@@ -182,5 +184,9 @@ func (enc *Encoder) encodeCommandMessage(m *CommandMessage) error {
 }
 
 func (enc *Encoder) encodeAggregateMessage(m *AggregateMessage) error {
-	return fmt.Errorf("Not implemented: AggregateMessage")
+	if err := encodeAggregateBody(enc.w, m.SubMessages); err != nil {
+		return errors.Wrap(err, "Failed to encode AggregateMessage")
+	}
+
+	return nil
 }

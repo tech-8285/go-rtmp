@@ -176,6 +176,13 @@ func (c *Conn) runHandleMessageLoop() error {
 }
 
 func (c *Conn) handleMessage(chunkStreamID int, timestamp uint32, cmsg *ChunkMessage) error {
+	// An aggregate message carries several sub-messages in its body. They are
+	// delivered one by one through the same path as if each of them had been
+	// sent as an independent message.
+	if aggMsg, ok := cmsg.Message.(*message.AggregateMessage); ok {
+		return c.handleAggregateMessage(chunkStreamID, timestamp, cmsg, aggMsg)
+	}
+
 	stream, err := c.streams.At(cmsg.StreamID)
 	if err != nil {
 		if c.config.IgnoreMessagesOnNotExistStream {
@@ -201,6 +208,46 @@ func (c *Conn) handleMessage(chunkStreamID int, timestamp uint32, cmsg *ChunkMes
 			return nil
 		}
 		return err
+	}
+
+	return nil
+}
+
+// handleAggregateMessage delivers every sub-message of an aggregate message.
+//
+// Sub-messages are delivered in the same order as they appear in the
+// aggregate. Their timestamps are rebased onto the stream timeline using the
+// timestamp of the aggregate message, so the timeline does not drift even when
+// multiple aggregate messages are received in a row.
+func (c *Conn) handleAggregateMessage(
+	chunkStreamID int,
+	timestamp uint32,
+	cmsg *ChunkMessage,
+	aggMsg *message.AggregateMessage,
+) error {
+	for i, subMsg := range aggMsg.SubMessages {
+		streamID := subMsg.StreamID
+		if streamID == 0 {
+			// The stream ID of a sub-message is optional. Senders which do not
+			// set it rely on the stream ID of the aggregate message itself.
+			streamID = cmsg.StreamID
+		}
+
+		subCMsg := ChunkMessage{
+			StreamID: streamID,
+			Message:  subMsg.Message,
+		}
+		subTimestamp := aggMsg.TimestampAt(timestamp, i)
+
+		if err := c.handleMessage(chunkStreamID, subTimestamp, &subCMsg); err != nil {
+			return errors.Wrapf(
+				err,
+				"Failed to handle aggregate sub-message: StreamID = %d, Index = %d, Timestamp = %d",
+				streamID,
+				i,
+				subTimestamp,
+			)
+		}
 	}
 
 	return nil

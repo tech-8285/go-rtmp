@@ -49,6 +49,17 @@ func assertEqualMessage(t *testing.T, expected, actual Message) {
 		require.Equal(t, expected.Encoding, actual.Encoding)
 		assertEqualPayload(t, expected.Body, actual.Body)
 
+	case *AggregateMessage:
+		actual, ok := actual.(*AggregateMessage)
+		require.True(t, ok)
+
+		require.Len(t, actual.SubMessages, len(expected.SubMessages))
+		for i := range expected.SubMessages {
+			require.Equal(t, expected.SubMessages[i].Timestamp, actual.SubMessages[i].Timestamp)
+			require.Equal(t, expected.SubMessages[i].StreamID, actual.SubMessages[i].StreamID)
+			assertEqualMessage(t, expected.SubMessages[i].Message, actual.SubMessages[i].Message)
+		}
+
 	default:
 		require.Equal(t, expected, actual)
 	}
