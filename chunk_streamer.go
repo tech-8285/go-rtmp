@@ -116,6 +116,20 @@ func (cs *ChunkStreamer) Write(
 	timestamp uint32,
 	cmsg *ChunkMessage,
 ) error {
+	return cs.writeWithCompletionCallback(ctx, chunkStreamID, timestamp, cmsg, nil)
+}
+
+// writeWithCompletionCallback is the same as Write, but onCompleted is called
+// from the scheduler loop after the message has been written out completely.
+// It guarantees that the callback is executed before any chunk queued after
+// this message is written.
+func (cs *ChunkStreamer) writeWithCompletionCallback(
+	ctx context.Context, // NOTE: Retire writing when a current chunk is busy
+	chunkStreamID int,
+	timestamp uint32,
+	cmsg *ChunkMessage,
+	onCompleted func(),
+) error {
 	writer, err := cs.NewChunkWriter(ctx, chunkStreamID)
 	if err != nil {
 		return err
@@ -130,6 +144,7 @@ func (cs *ChunkStreamer) Write(
 	writer.messageLength = uint32(writer.buf.Len())
 	writer.messageTypeID = byte(cmsg.Message.TypeID())
 	writer.messageStreamID = cmsg.StreamID
+	writer.onCompleted = onCompleted
 
 	return cs.Sched(writer)
 }
@@ -248,8 +263,8 @@ func (cs *ChunkStreamer) readChunk() (*ChunkStreamReader, error) {
 		panic("invalid state") // TODO fix
 	}
 
-	if uint32(expectLen) > cs.peerState.chunkSize {
-		expectLen = int(cs.peerState.chunkSize)
+	if peerChunkSize := cs.peerState.ChunkSize(); uint32(expectLen) > peerChunkSize {
+		expectLen = int(peerChunkSize)
 	}
 	//cs.logger.Debugf("(READ) Length = %d", expectLen)
 
@@ -278,8 +293,8 @@ func (cs *ChunkStreamer) writeChunk(writer *ChunkStreamWriter) (bool, error) {
 	//cs.logger.Debugf("(WRITE) Buffer: %+v", writer.buf.Bytes())
 
 	expectLen := writer.buf.Len()
-	if uint32(expectLen) > cs.selfState.chunkSize {
-		expectLen = int(cs.selfState.chunkSize)
+	if selfChunkSize := cs.selfState.ChunkSize(); uint32(expectLen) > selfChunkSize {
+		expectLen = int(selfChunkSize)
 	}
 
 	if err := encodeChunkBasicHeader(cs.w, &writer.basicHeader); err != nil {
@@ -464,6 +479,10 @@ func (sched *chunkStreamerWriterSched) Run() (err error) {
 				return err
 			}
 			if isCompleted {
+				if writer.onCompleted != nil {
+					writer.onCompleted()
+					writer.onCompleted = nil
+				}
 				close(writer.doneCh)
 				continue
 			}

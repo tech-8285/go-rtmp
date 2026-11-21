@@ -134,12 +134,8 @@ func (s *Stream) ReplyConnect(
 }
 
 func (s *Stream) CreateStream(body *message.NetConnectionCreateStream, chunkSize uint32) (*message.NetConnectionCreateStreamResult, error) {
-	oldChunkSize := s.conn.streamer.selfState.chunkSize
-	if chunkSize > 0 && chunkSize != oldChunkSize {
-		logrus.Infof("Changing chunkSize %d->%d", oldChunkSize, chunkSize)
-		s.conn.streamer.selfState.chunkSize = chunkSize
-		err := s.WriteSetChunkSize(chunkSize)
-		if err != nil {
+	if chunkSize > 0 {
+		if err := s.SetChunkSize(chunkSize); err != nil {
 			return nil, err
 		}
 	}
@@ -305,6 +301,68 @@ func (s *Stream) WriteDataMessage(
 	})
 }
 
+// SetChunkSize changes the chunk size used for messages sent by this endpoint.
+// It can be called at any time after the connection is established, even while
+// publishing or playing is in progress.
+//
+// A SetChunkSize message is sent to the peer and the new size is applied only
+// to chunks written after that message, so the peer can keep parsing
+// subsequent audio, video and data messages with their payloads and timestamps
+// intact. This method blocks until the notification has been written out and
+// the new chunk size has taken effect.
+//
+// If chunkSize is invalid, a non-nil error is returned and neither the current
+// chunk size nor the ongoing session is affected.
+func (s *Stream) SetChunkSize(chunkSize uint32) error {
+	selfState := s.streamer().SelfState()
+
+	oldChunkSize := selfState.ChunkSize()
+	if chunkSize == oldChunkSize {
+		return nil // Nothing to do
+	}
+	if err := selfState.CheckChunkSize(chunkSize); err != nil {
+		return errors.Wrap(err, "Failed to change chunk size")
+	}
+
+	s.logger().Infof("Changing chunkSize %d->%d", oldChunkSize, chunkSize)
+
+	// Notify the peer at first. The new chunk size is applied when the message
+	// has been written out completely, thus chunks which are already queued
+	// are still encoded with the old chunk size.
+	chunkStreamID := 2       // Correct according to 6.2
+	var timestamp uint32 = 0 // TODO. Send updated time
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second) // TODO: Fix 5s
+	defer cancel()
+
+	cmsg := &ChunkMessage{
+		StreamID: 0, // Protocol control messages are sent on the message stream 0
+		Message:  &message.SetChunkSize{ChunkSize: chunkSize},
+	}
+	doneCh := make(chan struct{})
+	err := s.streamer().writeWithCompletionCallback(ctx, chunkStreamID, timestamp, cmsg, func() {
+		// The chunk size was already validated, so this call never fails.
+		_ = selfState.SetChunkSize(chunkSize)
+		close(doneCh)
+	})
+	if err != nil {
+		return err
+	}
+
+	// Wait until the notification is written out and the new chunk size is applied
+	select {
+	case <-doneCh:
+		return nil
+	case <-s.streamer().Done():
+		return s.streamer().Err()
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+// WriteSetChunkSize sends a SetChunkSize message to the peer without changing
+// the chunk size of this endpoint. In most cases, use SetChunkSize instead,
+// which updates both the peer and the local state consistently.
 func (s *Stream) WriteSetChunkSize(chunkSize uint32) error {
 	if chunkSize < 1 {
 		return errors.New("chunksize < 1")

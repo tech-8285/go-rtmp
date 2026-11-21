@@ -82,7 +82,13 @@ func (h *streamHandler) Handle(chunkStreamID int, timestamp uint32, msg message.
 
 	case *message.SetChunkSize:
 		l.Infof("Handle SetChunkSize: Msg = %#v", msg)
-		return h.stream.streamer().PeerState().SetChunkSize(msg.ChunkSize)
+		if err := h.stream.streamer().PeerState().SetChunkSize(msg.ChunkSize); err != nil {
+			// Ignore an invalid chunk size notified by the peer instead of
+			// shutting down the connection. The current chunk size is left
+			// unchanged, thus the ongoing session is not affected.
+			l.Warnf("Ignored an invalid SetChunkSize: Err = %+v", err)
+		}
+		return nil
 
 	case *message.WinAckSize:
 		l.Infof("Handle WinAckSize: Msg = %#v", msg)

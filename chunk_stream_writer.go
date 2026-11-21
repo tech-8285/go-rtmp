@@ -20,6 +20,13 @@ type ChunkStreamWriter struct {
 	lastErr  error
 	aqM      sync.Mutex
 	newChunk bool
+
+	// onCompleted is called by the scheduler loop when the message held by
+	// this writer has been written out completely. It is consumed at most
+	// once and then cleared. This is used e.g. to apply a new chunk size
+	// only after a SetChunkSize message has actually been sent to the peer,
+	// so that chunks already queued keep being encoded with the old size.
+	onCompleted func()
 }
 
 func (w *ChunkStreamWriter) Write(b []byte) (int, error) {

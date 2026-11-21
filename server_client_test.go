@@ -145,6 +145,34 @@ func TestServerCanAcceptDeleteStream(t *testing.T) {
 	})
 }
 
+func TestClientCanChangeChunkSizeDuringSession(t *testing.T) {
+	config := &ConnConfig{
+		Handler: &serverCanAcceptCreateStreamHandler{},
+		Logger:  logrus.StandardLogger(),
+	}
+
+	prepareConnection(t, config, func(c *ClientConn) {
+		err := c.Connect(nil)
+		require.Nil(t, err)
+
+		// Specifying an initial chunk size on creating a stream still works
+		s0, err := c.CreateStream(nil, 4096)
+		require.Nil(t, err)
+		defer s0.Close()
+		require.Equal(t, uint32(4096), c.conn.streamer.SelfState().ChunkSize())
+
+		// The chunk size can be changed again during the session
+		err = s0.SetChunkSize(1024)
+		require.Nil(t, err)
+		require.Equal(t, uint32(1024), c.conn.streamer.SelfState().ChunkSize())
+
+		// An invalid size is rejected with an error and the session is kept
+		err = s0.SetChunkSize(0)
+		require.Error(t, err)
+		require.Equal(t, uint32(1024), c.conn.streamer.SelfState().ChunkSize())
+	})
+}
+
 func prepareConnection(t *testing.T, config *ConnConfig, f func(c *ClientConn)) {
 	// prepare server
 	l, err := net.Listen("tcp", "127.0.0.1:")

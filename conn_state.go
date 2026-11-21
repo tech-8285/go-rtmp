@@ -9,6 +9,7 @@ package rtmp
 
 import (
 	"math"
+	"sync"
 
 	"github.com/pkg/errors"
 	"github.com/yutopp/go-rtmp/message"
@@ -18,6 +19,7 @@ const DefaultChunkSize = 128
 const MaxChunkSize = 0xffffff // 5.4.1
 
 type StreamControlState struct {
+	chunkSizeM          sync.RWMutex
 	chunkSize           uint32
 	ackWindowSize       int32
 	bandwidthWindowSize int32
@@ -110,7 +112,24 @@ func NewStreamControlState(config *StreamControlStateConfig) *StreamControlState
 }
 
 func (s *StreamControlState) ChunkSize() uint32 {
+	s.chunkSizeM.RLock()
+	defer s.chunkSizeM.RUnlock()
+
 	return s.chunkSize
+}
+
+// CheckChunkSize checks that chunkSize can be applied to this state.
+// It returns a non-nil error when chunkSize is invalid, without changing the state.
+func (s *StreamControlState) CheckChunkSize(chunkSize uint32) error {
+	if chunkSize < 1 {
+		return errors.Errorf("Chunk size must be greater than 0: Value = %d", chunkSize)
+	}
+
+	if chunkSize > s.config.MaxChunkSize {
+		return errors.Errorf("Exceeded configured max chunk size: Limit = %d, Value = %d", s.config.MaxChunkSize, chunkSize)
+	}
+
+	return nil
 }
 
 func (s *StreamControlState) SetChunkSize(chunkSize uint32) error {
@@ -118,10 +137,12 @@ func (s *StreamControlState) SetChunkSize(chunkSize uint32) error {
 		chunkSize = MaxChunkSize
 	}
 
-	if chunkSize > s.config.MaxChunkSize {
-		return errors.Errorf("Exceeded configured max chunk size: Limit = %d, Value = %d", s.config.MaxChunkSize, chunkSize)
+	if err := s.CheckChunkSize(chunkSize); err != nil {
+		return err
 	}
 
+	s.chunkSizeM.Lock()
+	defer s.chunkSizeM.Unlock()
 	s.chunkSize = chunkSize
 
 	return nil
