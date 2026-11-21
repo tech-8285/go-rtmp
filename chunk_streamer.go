@@ -29,6 +29,22 @@ type ChunkMessage struct {
 	Message  message.Message
 }
 
+// scheduledWriter pairs a writer with the message epoch at which it was
+// queued. Stale entries left over after an abort carry an older epoch and are
+// discarded by the scheduler without touching the wire.
+type scheduledWriter struct {
+	writer *ChunkStreamWriter
+	epoch  uint64
+}
+
+// abortRequest asks the scheduler goroutine to abort the in-flight message of
+// a single chunk stream. The reply channel is closed once the AbortMessage has
+// been sent and the writer has been reset.
+type abortRequest struct {
+	chunkStreamID int
+	replyCh       chan struct{}
+}
+
 type ChunkStreamer struct {
 	r *ChunkStreamerReader
 	w *ChunkStreamerWriter
@@ -72,7 +88,8 @@ func NewChunkStreamer(r io.Reader, w io.Writer, config *StreamControlStateConfig
 		writers: make(map[int]*ChunkStreamWriter),
 
 		writerSched: &chunkStreamerWriterSched{
-			writers: make(chan *ChunkStreamWriter, maxWriterQueueSize),
+			writers: make(chan scheduledWriter, maxWriterQueueSize),
+			abortCh: make(chan abortRequest, maxWriterQueueSize),
 			stopCh:  make(chan struct{}),
 		},
 
@@ -134,6 +151,79 @@ func (cs *ChunkStreamer) Write(
 	return cs.Sched(writer)
 }
 
+// WriteWithDeadline schedules a message exactly like Write, but it also waits
+// for the whole message to be flushed. If the context is canceled (for example
+// because a send deadline expired) before the message completed, the remaining
+// chunks are aborted: an AbortMessage is delivered to the peer, the unfinished
+// message is dropped and ErrMessageAborted is returned. The same chunk stream is
+// immediately reusable for another message afterwards.
+//
+// Passing context.Background() keeps the ordinary, non-deadlined behavior: the
+// call blocks until the message has been fully written.
+func (cs *ChunkStreamer) WriteWithDeadline(
+	ctx context.Context,
+	chunkStreamID int,
+	timestamp uint32,
+	cmsg *ChunkMessage,
+) error {
+	writer, err := cs.NewChunkWriter(ctx, chunkStreamID)
+	if err != nil {
+		return err
+	}
+
+	cs.msgEnc.Reset(writer)
+	if err := cs.msgEnc.Encode(cmsg.Message); err != nil {
+		return err
+	}
+	writer.timestamp = timestamp
+	writer.messageLength = uint32(writer.buf.Len())
+	writer.messageTypeID = byte(cmsg.Message.TypeID())
+	writer.messageStreamID = cmsg.StreamID
+
+	if err := cs.Sched(writer); err != nil {
+		return err
+	}
+
+	// Wait for completion. A canceled context means the send deadline expired
+	// before the message finished, therefore abort the rest of its chunks.
+	if err := writer.Wait(ctx); err != nil {
+		if ctx.Err() != nil {
+			if abortErr := cs.Abort(chunkStreamID); abortErr != nil {
+				return errors.Wrapf(abortErr, "Failed to abort message: Original error = %+v", err)
+			}
+			return ErrMessageAborted
+		}
+		return err
+	}
+
+	return nil
+}
+
+// Abort stops sending the message which is currently being written on the given
+// chunk stream, sends an AbortMessage (message type id 2) to the peer so that it
+// discards the partially received message, and resets the writer so that a new
+// message can be sent on the same chunk stream.
+// It is a no-op when no message is in flight on that chunk stream.
+func (cs *ChunkStreamer) Abort(chunkStreamID int) error {
+	req := abortRequest{
+		chunkStreamID: chunkStreamID,
+		replyCh:       make(chan struct{}),
+	}
+
+	select {
+	case cs.writerSched.abortCh <- req:
+	case <-cs.writerSched.stopCh:
+		return errors.New("Failed to abort message: chunk streamer is closed")
+	}
+
+	select {
+	case <-req.replyCh:
+		return nil
+	case <-cs.writerSched.stopCh:
+		return errors.New("Failed to abort message: chunk streamer is closed")
+	}
+}
+
 func (cs *ChunkStreamer) NewChunkReader() (*ChunkStreamReader, error) {
 again:
 	reader, err := cs.readChunk()
@@ -150,11 +240,45 @@ again:
 	if !reader.completed {
 		goto again
 	}
+
+	// A completed AbortMessage asks us to drop the unfinished message of the
+	// named chunk stream. It must never be delivered to upper layers.
+	if reader.messageTypeID == byte(message.TypeIDAbortMessage) {
+		var decoded message.Message
+		cs.msgDec.Reset(reader)
+		if err := cs.msgDec.Decode(message.TypeIDAbortMessage, &decoded); err != nil {
+			return nil, errors.Wrapf(err, "Failed to decode AbortMessage")
+		}
+
+		cs.discardChunkReader(int(decoded.(*message.AbortMessage).ChunkStreamID))
+		goto again
+	}
+
 	return reader, nil
+}
+
+// discardChunkReader drops every buffered (and possibly partial) message state
+// kept for the given chunk stream, so that the next message arriving on it starts
+// cleanly. Other chunk streams are not affected.
+func (cs *ChunkStreamer) discardChunkReader(chunkStreamID int) {
+	cs.mu.Lock()
+	defer cs.mu.Unlock()
+
+	reader, ok := cs.readers[chunkStreamID]
+	if !ok {
+		return
+	}
+	reader.buf.Reset()
+	reader.completed = false
+	reader.messageLength = 0
+	reader.timestamp = 0
+	reader.timestampDelta = 0
 }
 
 // NewChunkWriter Returns a writer for a chunkStreamID.
 // Wait until writing have been finished if the writer is running.
+// An aborted previous message is consumed transparently inside Wait so the same
+// chunk stream can immediately be reused for a new message.
 func (cs *ChunkStreamer) NewChunkWriter(ctx context.Context, chunkStreamID int) (*ChunkStreamWriter, error) {
 	writer, err := cs.prepareChunkWriter(chunkStreamID)
 	if err != nil {
@@ -167,9 +291,21 @@ func (cs *ChunkStreamer) NewChunkWriter(ctx context.Context, chunkStreamID int) 
 	return writer, nil
 }
 
+// Sched marks writer as carrying a new message and enqueues it. All epoch and
+// in-flight state is updated under stateM so it is synchronized with the
+// scheduler goroutine (which reads the snapshot carried by the queue entry).
 func (cs *ChunkStreamer) Sched(writer *ChunkStreamWriter) error {
+	writer.stateM.Lock()
 	writer.newChunk = true
-	return cs.writerSched.Sched(writer)
+	writer.inFlight = true
+	writer.epoch++
+	entry := scheduledWriter{
+		writer: writer,
+		epoch:  writer.epoch,
+	}
+	writer.stateM.Unlock()
+
+	return cs.writerSched.Sched(entry)
 }
 
 func (cs *ChunkStreamer) SelfState() *StreamControlState {
@@ -245,7 +381,14 @@ func (cs *ChunkStreamer) readChunk() (*ChunkStreamReader, error) {
 
 	expectLen := int(reader.messageLength) - reader.buf.Len()
 	if expectLen <= 0 {
-		panic("invalid state") // TODO fix
+		// A message length that does not advance the buffer means the chunk
+		// stream is in an inconsistent state (for example a truncated message
+		// left over before an abort was processed). Report it as an error
+		// instead of panicking so the connection can fail cleanly.
+		return nil, errors.Errorf(
+			"invalid chunk stream state: message length = %d, buffered = %d, chunk stream id = %d",
+			reader.messageLength, reader.buf.Len(), bh.chunkStreamID,
+		)
 	}
 
 	if uint32(expectLen) > cs.peerState.chunkSize {
@@ -431,14 +574,116 @@ func (cs *ChunkStreamer) sendAck(readBytes uint32) error {
 	})
 }
 
+// handleAbort runs on the scheduler goroutine and performs a message abort.
+// It marks the in-flight message as failed, drops its remaining chunks, notifies
+// the peer with an AbortMessage and re-arms the writer for the next message.
+func (cs *ChunkStreamer) handleAbort(req abortRequest) {
+	defer close(req.replyCh)
+
+	cs.mu.Lock()
+	writer, ok := cs.writers[req.chunkStreamID]
+	cs.mu.Unlock()
+	if !ok {
+		// Nothing was ever written on this chunk stream: nothing to abort.
+		return
+	}
+
+	// Serialize against waiters of this writer while re-arming completion.
+	writer.aqM.Lock()
+	defer writer.aqM.Unlock()
+
+	// Only a message that is still in flight can be aborted. Aborting an idle
+	// chunk stream is a no-op and emits nothing.
+	writer.stateM.Lock()
+	if !writer.inFlight {
+		writer.stateM.Unlock()
+		return
+	}
+	writer.stateM.Unlock()
+
+	// Drop the unfinished message and reset header state so that the next
+	// message on this chunk stream starts with a fresh type-0 header.
+	writer.resetForNewMessage()
+
+	if err := cs.sendAbortMessage(uint32(req.chunkStreamID)); err != nil {
+		cs.logger.Errorf("Failed to send AbortMessage: ChunkStreamID = %d, Err = %+v", req.chunkStreamID, err)
+	}
+
+	// Surface a clear failure to whoever is waiting for the aborted message.
+	// Bumping the epoch invalidates every stale entry still sitting in the
+	// scheduler queue. The completion channel is left closed (NOT re-armed here):
+	// the next Wait observes and consumes this abort, clears the error and
+	// re-arms the channel itself, allowing the chunk stream to be reused.
+	writer.stateM.Lock()
+	writer.inFlight = false
+	writer.epoch++
+	writer.stateM.Unlock()
+	writer.lastErr = ErrMessageAborted
+	close(writer.doneCh)
+}
+
+// sendAbortMessage writes an RTMP AbortMessage (type id 2) on the control chunk
+// stream. It is emitted directly from the scheduler goroutine, therefore it does
+// not contend with ordinary chunk output and works even before the control
+// stream callback is wired up.
+func (cs *ChunkStreamer) sendAbortMessage(chunkStreamID uint32) error {
+	cs.logger.Debugf("Sending AbortMessage...: ChunkStreamID = %d", chunkStreamID)
+
+	// Prefer the control-stream callback when a full connection is available so
+	// that protocol control messages share the standard write path.
+	if cs.controlStreamWriter != nil {
+		return cs.controlStreamWriter(ctrlMsgChunkStreamID, 0, &message.AbortMessage{
+			ChunkStreamID: chunkStreamID,
+		})
+	}
+
+	return cs.writeControlMessage(&message.AbortMessage{
+		ChunkStreamID: chunkStreamID,
+	})
+}
+
+// writeControlMessage serializes a protocol control message into a single chunk
+// on the control chunk stream and flushes it. Used only from the scheduler
+// goroutine (abort handling) where no other write is in progress.
+func (cs *ChunkStreamer) writeControlMessage(msg message.Message) error {
+	writer, err := cs.prepareChunkWriter(ctrlMsgChunkStreamID)
+	if err != nil {
+		return errors.Wrapf(err, "Failed to prepare control writer")
+	}
+
+	writer.buf.Reset()
+	cs.msgEnc.Reset(writer)
+	if err := cs.msgEnc.Encode(msg); err != nil {
+		return err
+	}
+
+	writer.timestamp = 0
+	writer.messageLength = uint32(writer.buf.Len())
+	writer.messageTypeID = byte(msg.TypeID())
+	writer.messageStreamID = ControlStreamID
+	writer.newChunk = true
+
+	// Control messages are small: keep flushing until the single chunk is sent.
+	for {
+		completed, err := cs.writeChunk(writer)
+		if err != nil {
+			return err
+		}
+		if completed {
+			return cs.w.Flush()
+		}
+	}
+}
+
 type chunkStreamerWriterSched struct {
 	streamer *ChunkStreamer
-	writers  chan *ChunkStreamWriter
+	writers  chan scheduledWriter
+	abortCh  chan abortRequest
 	stopCh   chan struct{}
 }
 
-func (sched *chunkStreamerWriterSched) Sched(writer *ChunkStreamWriter) error {
-	sched.writers <- writer
+func (sched *chunkStreamerWriterSched) Sched(entry scheduledWriter) error {
+	sched.writers <- entry
 
 	return nil
 }
@@ -456,20 +701,46 @@ func (sched *chunkStreamerWriterSched) Run() (err error) {
 
 	for {
 		select {
-		case writer := <-sched.writers:
+		case req := <-sched.abortCh:
+			sched.streamer.handleAbort(req)
+
+		case entry := <-sched.writers:
+			writer := entry.writer
+
+			// Drop entries left over from an aborted (or superseded) message so
+			// that no stale chunk of an older message reaches the wire. The
+			// shared scheduling state is read under stateM to stay race-free
+			// with Sched/Wait/handleAbort running on other goroutines.
+			writer.stateM.Lock()
+			stale := entry.epoch != writer.epoch || !writer.inFlight
+			currentEpoch := writer.epoch
+			writer.stateM.Unlock()
+			if stale {
+				continue
+			}
+
 			isCompleted, err := sched.streamer.writeChunk(writer)
 			if err != nil {
+				writer.stateM.Lock()
+				writer.inFlight = false
+				writer.stateM.Unlock()
 				writer.lastErr = err
 				close(writer.doneCh)
 				return err
 			}
 			if isCompleted {
+				writer.stateM.Lock()
+				writer.inFlight = false
+				writer.stateM.Unlock()
 				close(writer.doneCh)
 				continue
 			}
 
-			// Enqueue writer
-			sched.writers <- writer
+			// Enqueue writer again, preserving the current epoch.
+			sched.writers <- scheduledWriter{
+				writer: writer,
+				epoch:  currentEpoch,
+			}
 
 		case <-sched.stopCh:
 			return nil

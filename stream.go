@@ -326,6 +326,23 @@ func (s *Stream) Write(chunkStreamID int, timestamp uint32, msg message.Message)
 	return s.streamer().Write(ctx, chunkStreamID, timestamp, &s.cmsg)
 }
 
+// WriteWithDeadline writes a message and waits for it to be fully sent. If ctx
+// is canceled (for example because a send deadline expired) before the message
+// completed, the remaining chunks are aborted, the peer is notified with an
+// AbortMessage and ErrMessageAborted is returned. The same chunk stream can be
+// used to send another message afterwards.
+func (s *Stream) WriteWithDeadline(ctx context.Context, chunkStreamID int, timestamp uint32, msg message.Message) error {
+	s.cmsg.Message = msg
+	return s.streamer().WriteWithDeadline(ctx, chunkStreamID, timestamp, &s.cmsg)
+}
+
+// Abort aborts the message currently being sent on chunkStreamID. The peer
+// receives an AbortMessage and discards the unfinished message on that chunk
+// stream; other chunk streams are not affected.
+func (s *Stream) Abort(chunkStreamID int) error {
+	return s.streamer().Abort(chunkStreamID)
+}
+
 func (s *Stream) handle(chunkStreamID int, timestamp uint32, msg message.Message) error {
 	return s.handler.Handle(chunkStreamID, timestamp, msg)
 }

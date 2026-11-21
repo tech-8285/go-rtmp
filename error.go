@@ -17,6 +17,12 @@ import (
 
 var ErrClosed = errors.New("Server is closed")
 
+// ErrMessageAborted is returned when a message could not be finished before its
+// send deadline expired (or it was aborted explicitly).
+// The remaining chunks are not sent and an AbortMessage is delivered to the peer
+// so that it discards the unfinished message on the same chunk stream.
+var ErrMessageAborted = errors.New("Message was aborted before completion")
+
 type ConnectRejectedError struct {
 	TransactionID int64
 	Result        *message.NetConnectionConnectResult
